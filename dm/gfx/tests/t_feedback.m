@@ -467,7 +467,9 @@ static void reuse_tables_case(void) {
     CHECK(g_mrbuf_n == 16 && g_mrbuf[15] == small, "a new size makes room with the oldest");
     CHECK(mrbuf_get(4096) == small, "and is found again");
 }
-// A cut with earlier work still running stays a boundary for the game's timestamps, and commits only when the GPU has run out; a report after it takes that boundary's time
+// A cut with earlier work still running stays a boundary for the game's timestamps, and commits only when the GPU has run out; a report after it takes that boundary's time.
+// Each report is checked against its own boundary's GPU timestamp: two reports compared with each other alone pass on any clock, and with guest_ns the weak 0 here they
+// used to take the CPU's monotonic clock in the completion handler, whose microsecond steps read one time for both about 1 run in 13 on an M4 Max
 static void cut_boundary_case(void) {
     tex_t colour; target(&colour, 99810);
     id<MTLBuffer> rep = [g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared]; res_add(rep);
@@ -481,6 +483,7 @@ static void cut_boundary_case(void) {
     g_stat_draw += (uint64_t)cut_draws(); sub_cut();
     CHECK(g_cb == cb0 && g_seg == 1, "with work running: a boundary, no commit");
     CHECK(g_sclk && g_sclk->nb == 2, "and its timestamp slot");
+    NSUInteger slot[2] = {g_sclk ? g_sclk->b[0] : 0, g_sclk ? g_sclk->b[1] : 0};   // the submission's first boundary (report 0, TIMESTAMP_TOP of segment 0) and the cut's (report 1, segment 1)
     clear(MTLClearColorMake(0, 1, 0, 1)); rp_end();
     mtl_sub_counter((uint64_t)rep.contents + 16, 0x10);
     atomic_fetch_sub(&g_seg_inflight, 1);
@@ -489,7 +492,13 @@ static void cut_boundary_case(void) {
     clear(MTLClearColorMake(0, 0, 1, 1)); rp_end();
     CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "the segments completed");
     uint64_t r0[2], r1[2]; memcpy(r0, rep.contents, 16); memcpy(r1, (uint8_t *)rep.contents + 16, 16);
-    CHECK(r0[1] && r1[1] > r0[1], "two reports in one command buffer read two times");
+    uint64_t e[2] = {0, 0};
+    for (int i = 0; i < 2; i++) { NSData *dd = [g_ts_heap resolveCounterRange:NSMakeRange(slot[i], 1)]; if (dd.length >= sizeof(MTL4TimestampHeapEntry)) e[i] = ((const MTL4TimestampHeapEntry *)dd.bytes)->timestamp; }
+    CHECK(slot[0] != slot[1] && e[0] && e[1] >= e[0], "the GPU wrote the two boundaries in two slots, in order");
+    uint64_t hz = [g_dev queryTimestampFrequency]; double tick = hz ? 1e9 / (double)hz : 1;
+    uint64_t want = e[1] >= e[0] ? nvn_timestamp_from_ns((uint64_t)((double)(e[1] - e[0]) * tick)) : 0, got = r1[1] >= r0[1] ? r1[1] - r0[1] : 0;
+    CHECK(r0[1] && r1[1] >= r0[1], "two reports in one command buffer keep their order");   // equal when the GPU wrote both boundaries at one time (relaxed granularity), as NVN allows
+    CHECK(got + 16 >= want && got <= want + 16, "and lie as far apart as their boundaries did on the GPU: each took its own boundary's time");   // 16 ticks, 26 ns: both reports convert through one clock pair, so only rounding separates them (at most 4 ticks at a year's uptime)
 }
 int main(int argc, char **argv) { @autoreleasepool {
     setenv("DM_NVN_TBDR", "0", 1); setenv("DM_NVN_GPU_TS", "segment", 1);
